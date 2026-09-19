@@ -265,4 +265,60 @@ risk = analyze_supplier_risk(text="脱盐乳清", plans_text="", declared=[])
 assert "脱盐乳清" in risk["unknown_ingredients"]
 print("8. 原料别名（原子校验/最短环路/链式解析/原名展示/时效复核边界/不接入风险预览） OK")
 
+# 9. 共线生产换线排程（临时预览，不改写审查记录）
+from app.changeover import (ChangeoverError, build_changeover_preview,
+                            build_schedule, list_changeover_products)
+
+# 9a. 候选产品清单：rid_alias 处于需复核状态，禁止参与并给出原因；
+#     两版记录取标签核对对象（新版配方）的最终过敏原集合
+products = list_changeover_products()
+by_id = {p["id"]: p for p in products}
+assert by_id[rid_alias]["eligible"] is False
+assert "需复核" in by_id[rid_alias]["blocked_reason"]
+assert by_id[rid]["eligible"] and by_id[old_rid]["eligible"]
+assert by_id[rid]["source_version"] == "新版配方"
+assert set(by_id[rid]["allergens"]) == {"麸质谷物", "坚果", "蛋类", "芝麻", "大豆"}
+
+# 9b. 正常排程：段数 = 产品数 - 1，总耗时 = 各段之和；
+#     两条记录新版配方过敏原集合相同 → 两方向成本均为 0，并列按 ID 升序
+before = db.get_review(rid)
+sched = build_changeover_preview([old_rid, rid], {"麸质谷物": 10, "坚果": 20})
+assert len(sched["segments"]) == 1
+assert sched["total_minutes"] == sum(s["minutes"] for s in sched["segments"])
+assert sched["total_minutes"] == sched["segments"][-1]["cumulative_minutes"]
+assert sched["order"] == sorted([old_rid, rid]) and sched["total_minutes"] == 0
+assert sched["optimal_count"] == 2
+
+# 9c. 缺失 / 需复核记录禁止参与并指出原因
+try:
+    build_changeover_preview([rid, rid_alias], {})
+    raise AssertionError("需复核记录应被拒绝")
+except ChangeoverError as exc:
+    assert exc.problems and exc.problems[0]["reason"] == "stale"
+    assert "需复核" in exc.problems[0]["message"]
+try:
+    build_changeover_preview([rid, 999999], {})
+    raise AssertionError("缺失记录应被拒绝")
+except ChangeoverError as exc:
+    assert exc.problems[0]["reason"] == "missing"
+
+# 9d. 子集 DP（纯计算）：成本有向、并列按产品 ID 序列取最小
+prods = [
+    {"id": 1, "name": "甲", "allergens": ["乳", "大豆"]},
+    {"id": 2, "name": "乙", "allergens": ["乳"]},
+    {"id": 3, "name": "丙", "allergens": []},
+]
+r = build_schedule(prods, {"乳": 5, "大豆": 10})
+assert r["order"] == [3, 2, 1] and r["total_minutes"] == 0
+assert r["optimal_count"] == 1
+same = [{"id": i, "name": str(i), "allergens": ["乳"]} for i in (7, 5, 9)]
+r = build_schedule(same, {"乳": 5})
+assert r["order"] == [5, 7, 9] and r["optimal_count"] == 6
+
+# 9e. 只读：记录内容与时效状态不变，不产生新记录
+assert db.get_review(rid) == before
+assert db.get_review(rid_alias)["needs_recheck"] is True
+assert len(db.list_reviews()) == 3
+print("9. 共线生产换线排程（候选资格/有向成本/子集DP/并列/禁止参与/只读） OK")
+
 print("\n全部集成冒烟测试通过 ✔")

@@ -8,13 +8,14 @@
 - 对照标签声明，指出遗漏 / 多报的过敏原；
 - 支持两版配方对比，输出过敏原变化；
 - 生成并导出标签审查报告（HTML / Markdown）；
-- 临时预览工具：供应商方案风险区间、配料占比区间顺序校验（只读，不写历史）。
+- 临时预览工具：供应商方案风险区间、配料占比区间顺序校验、共线生产换线
+  排程（只读，不写历史、不改写审查记录）。
 """
 from __future__ import annotations
 
 import os
 from contextlib import asynccontextmanager
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, HTMLResponse, Response
@@ -23,6 +24,8 @@ from pydantic import BaseModel, Field
 from . import db
 from .aliases import resolve_preview, validate_alias_batch
 from .analysis import flatten, normalize_name
+from .changeover import (ChangeoverError, build_changeover_preview,
+                         list_changeover_products)
 from .parser import parse_recipe
 from .proportion import analyze_proportions
 from .recheck import build_recheck
@@ -90,6 +93,11 @@ class SupplierRiskPreview(BaseModel):
 
 class ProportionPreview(BaseModel):
     text: str
+
+
+class ChangeoverPreview(BaseModel):
+    review_ids: List[int]
+    cleaning_minutes: Dict[str, float] = Field(default_factory=dict)
 
 
 # ---------- 页面 ----------
@@ -224,6 +232,39 @@ def proportion_check_preview(payload: ProportionPreview):
     if not payload.text.strip():
         raise HTTPException(400, "配方文本不能为空")
     return analyze_proportions(payload.text)
+
+
+# ---------- 共线生产换线排程（临时预览） ----------
+
+@app.get("/api/changeover/products")
+def changeover_products():
+    """换线排程候选产品清单。
+
+    每条历史审查记录给出当前配方（两版记录取标签核对对象，即新版配方）
+    的最终过敏原集合与参与资格；处于需复核状态的记录标记为禁止参与并
+    附原因。只读，不改写任何数据。
+    """
+    return {"products": list_changeover_products()}
+
+
+@app.post("/api/changeover-schedule-preview")
+def changeover_schedule_preview(payload: ChangeoverPreview):
+    """共线生产换线排程（临时预览）。
+
+    复用历史审查记录当前配方的最终过敏原集合，按「前一产品含有、后一
+    产品不含」的过敏原计算有向换线成本（各过敏原清洁分钟数之和，未配置
+    的按 0 分钟计），用子集动态规划求总清洁时间最短的完整生产顺序；
+    总耗时并列时按产品 ID 序列取最小者，并返回并列最优顺序总数。记录
+    缺失或处于需复核状态时禁止参与并逐条指出原因。只读计算，不改写
+    任何审查记录。
+    """
+    try:
+        return build_changeover_preview(
+            payload.review_ids, payload.cleaning_minutes)
+    except ChangeoverError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"message": str(exc), "problems": exc.problems})
 
 
 # ---------- 审查 ----------
