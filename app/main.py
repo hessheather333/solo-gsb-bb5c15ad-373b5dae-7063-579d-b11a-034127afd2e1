@@ -8,13 +8,14 @@
 - 对照标签声明，指出遗漏 / 多报的过敏原；
 - 支持两版配方对比，输出过敏原变化；
 - 生成并导出标签审查报告（HTML / Markdown）；
-- 临时预览工具：供应商方案风险区间、配料占比区间顺序校验（只读，不写历史）。
+- 临时预览工具：供应商方案风险区间、配料占比区间顺序校验、共线生产换线
+  排程（只读，不写历史）。
 """
 from __future__ import annotations
 
 import os
 from contextlib import asynccontextmanager
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, HTMLResponse, Response
@@ -23,6 +24,7 @@ from pydantic import BaseModel, Field
 from . import db
 from .aliases import resolve_preview, validate_alias_batch
 from .analysis import flatten, normalize_name
+from .changeover import ChangeoverError, build_schedule
 from .parser import parse_recipe
 from .proportion import analyze_proportions
 from .recheck import build_recheck
@@ -90,6 +92,11 @@ class SupplierRiskPreview(BaseModel):
 
 class ProportionPreview(BaseModel):
     text: str
+
+
+class ChangeoverPreview(BaseModel):
+    review_ids: List[int] = Field(default_factory=list)
+    clean_minutes: Dict[str, float] = Field(default_factory=dict)
 
 
 # ---------- 页面 ----------
@@ -224,6 +231,27 @@ def proportion_check_preview(payload: ProportionPreview):
     if not payload.text.strip():
         raise HTTPException(400, "配方文本不能为空")
     return analyze_proportions(payload.text)
+
+
+# ---------- 共线生产换线排程（临时预览） ----------
+
+@app.post("/api/changeover-preview")
+def changeover_preview(payload: ChangeoverPreview):
+    """共线生产换线排程（临时预览）。
+
+    复用历史审查记录「当前配方」（标签核对版本）的最终过敏原集合：按
+    「前一产品含有、后一产品不含」的过敏原与配置的各过敏原清洁分钟数计算
+    有向换线成本，用子集动态规划求总清洁时间最短的完整生产顺序（总耗时
+    并列时按产品 ID 序列字典序取最小者），逐段返回需清洁过敏原、耗时与
+    累计耗时。记录缺失或处于需复核状态时禁止参与并逐条指出原因。
+    只读计算，不改写任何审查记录。
+    """
+    try:
+        return build_schedule(payload.review_ids, payload.clean_minutes)
+    except ChangeoverError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"message": str(exc), "errors": exc.errors})
 
 
 # ---------- 审查 ----------

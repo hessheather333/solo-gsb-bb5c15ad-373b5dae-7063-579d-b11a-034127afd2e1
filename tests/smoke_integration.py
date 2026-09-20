@@ -265,4 +265,53 @@ risk = analyze_supplier_risk(text="脱盐乳清", plans_text="", declared=[])
 assert "脱盐乳清" in risk["unknown_ingredients"]
 print("8. 原料别名（原子校验/最短环路/链式解析/原名展示/时效复核边界/不接入风险预览） OK")
 
+# 9. 共线生产换线排程（临时预览，不写历史）
+from app.changeover import ChangeoverError, build_schedule
+
+def _mk_product(name, text):
+    res, fp = analyze(text_a=text, text_b=None, label_a="现版配方",
+                      label_b="新版配方", declared=[])
+    return db.create_review(name=name, declared=[], text_a=text, text_b=None,
+                            label_a="现版配方", label_b="新版配方",
+                            result=res, dict_fingerprint=fp)
+
+co_a = _mk_product("排程A", "配料表：乳清粉")            # {乳}
+co_b = _mk_product("排程B", "配料表：乳清粉，鸡蛋")      # {乳, 蛋类}
+co_c = _mk_product("排程C", "配料表：鸡蛋")              # {蛋类}
+review_count = len(db.list_reviews())
+
+# 9a. 子集 DP 最优顺序：A{乳} -> B{乳,蛋} -> C{蛋}，仅 B->C 清洁「乳」10 分钟
+sched = build_schedule([co_c, co_a, co_b], {"乳": 10, "蛋类": 10})
+assert sched["order"] == [co_a, co_b, co_c], sched["order"]
+assert sched["total_minutes"] == 10
+assert [s["allergens"] for s in sched["segments"]] == [[], ["乳"]]
+assert [s["minutes"] for s in sched["segments"]] == [0, 10]
+assert [s["cumulative"] for s in sched["segments"]] == [0, 10]
+assert sched["allergen_union"] == ["乳", "蛋类"]
+
+# 9b. 总耗时并列时按产品 ID 序列字典序取最小者
+sched = build_schedule([co_c, co_a], {"乳": 10, "蛋类": 10})
+assert sched["order"] == sorted([co_a, co_c]) and sched["total_minutes"] == 10
+
+# 9c. 记录缺失 / 需复核禁止参与并指出原因
+try:
+    build_schedule([co_a, 999999], {"乳": 10})
+    raise AssertionError("应拒绝缺失记录")
+except ChangeoverError as exc:
+    assert any("不存在" in e["reason"] for e in exc.errors), exc.errors
+db.upsert_entry("鸡蛋", ["蛋类", "大豆"])  # co_b 涉及原料映射变更 -> 需复核
+try:
+    build_schedule([co_a, co_b], {"乳": 10})
+    raise AssertionError("应拒绝需复核记录")
+except ChangeoverError as exc:
+    assert any("需复核" in e["reason"] for e in exc.errors), exc.errors
+db.upsert_entry("鸡蛋", ["蛋类"])  # 恢复字典，不影响后续断言
+
+# 9d. 只读：不产生新记录，既有记录内容不变
+before = db.get_review(co_a)
+build_schedule([co_a, co_b, co_c], {"乳": 10, "蛋类": 20})
+assert len(db.list_reviews()) == review_count
+assert db.get_review(co_a) == before
+print("9. 共线生产换线排程（子集 DP 最优/ID 序列并列/逐段累计/缺失与需复核拒绝/只读） OK")
+
 print("\n全部集成冒烟测试通过 ✔")

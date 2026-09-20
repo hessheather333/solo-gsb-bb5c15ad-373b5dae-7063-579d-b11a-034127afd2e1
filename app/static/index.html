@@ -100,7 +100,7 @@
 <body>
 <header>
   <h1>🥜 食品过敏原标签审查台</h1>
-  <p>解析嵌套子配料配方 · 传播汇总过敏原 · 核对标签遗漏/多报 · 配方版本对比 · 导出审查报告</p>
+  <p>解析嵌套子配料配方 · 传播汇总过敏原 · 核对标签遗漏/多报 · 配方版本对比 · 导出审查报告 · 共线换线排程预览</p>
 </header>
 <main>
 
@@ -227,6 +227,22 @@
 <section>
   <h2>⑦ 历史审查记录</h2>
   <div id="history-table"><p class="hint">暂无记录</p></div>
+</section>
+
+<section>
+  <h2>⑧ 共线生产换线排程 <span class="pill gray">临时预览</span></h2>
+  <p class="hint">勾选 <b>2～10</b> 个历史审查记录作为共线生产的产品，系统取每条记录<b>当前配方</b>
+    （标签核对版本）的最终过敏原集合：换线时需清洁「<b>前一产品含有、后一产品不含</b>」的过敏原，
+    按配置的各过敏原清洁分钟数计算有向换线成本，用<b>子集动态规划</b>求总清洁时间最短的完整生产
+    顺序（总耗时并列时按产品 ID 序列字典序取最小者），并逐段展示需清洁过敏原、耗时与累计耗时。
+    <b>需复核或已删除的记录禁止参与</b>（勾选后提交会逐条指出原因）。本预览只读，不改写审查记录。</p>
+  <div id="changeover-products"><p class="hint">暂无历史记录</p></div>
+  <div class="toolbar">
+    <button onclick="prepareChangeover()">生成清洁配置</button>
+    <span id="changeover-msg" class="error" style="white-space:pre-wrap"></span>
+  </div>
+  <div id="changeover-minutes"></div>
+  <div id="changeover-result"></div>
 </section>
 
 </main>
@@ -532,6 +548,7 @@ function resultBodyHtml(r, meta) {
 /* ---------- 历史 ---------- */
 async function loadHistory() {
   const {reviews} = await api('/api/reviews');
+  renderChangeoverProducts(reviews);
   if (!reviews.length) {
     $('history-table').innerHTML = '<p class="hint">暂无记录</p>';
     return;
@@ -720,6 +737,119 @@ async function deleteReview(id) {
   if (!confirm('确定删除该审查记录？')) return;
   await api('/api/reviews/' + id, {method: 'DELETE'});
   await loadHistory();
+}
+
+/* ---------- 共线生产换线排程（临时预览） ---------- */
+let changeoverMinutes = {};   // 过敏原 -> 用户已输入的清洁分钟数（重新渲染时保留）
+
+function renderChangeoverProducts(reviews) {
+  const wrap = $('changeover-products');
+  if (!reviews.length) {
+    wrap.innerHTML = '<p class="hint">暂无历史记录，请先在「③ 新建标签审查」创建审查。</p>';
+    return;
+  }
+  wrap.innerHTML = '<div class="check-grid">' + reviews.map(r => {
+    if (r.needs_recheck) {
+      const why = r.recheck_reason === 'legacy' ? '旧记录无字典指纹' : '相关原料映射已变更';
+      return `<label title="${esc(why)}"><input type="checkbox" disabled> #${r.id} ${esc(r.name)}
+        <span class="pill orange">需复核，禁止参与</span></label>`;
+    }
+    return `<label><input type="checkbox" class="changeover-check" value="${r.id}"
+      onchange="resetChangeover()"> #${r.id} ${esc(r.name)}</label>`;
+  }).join('') + '</div>';
+}
+
+function resetChangeover() {
+  $('changeover-minutes').innerHTML = '';
+  $('changeover-result').innerHTML = '';
+  $('changeover-msg').textContent = '';
+}
+
+function selectedChangeoverIds() {
+  return [...document.querySelectorAll('.changeover-check:checked')]
+    .map(i => parseInt(i.value, 10));
+}
+
+function changeoverErrorText(e) {
+  const errs = (e.detail && e.detail.errors) || [];
+  return errs.length
+    ? e.message + '\n' + errs.map(x =>
+        `· #${x.id}${x.name ? ' ' + x.name : ''}：${x.reason}`).join('\n')
+    : e.message;
+}
+
+async function prepareChangeover() {
+  $('changeover-msg').textContent = '';
+  $('changeover-result').innerHTML = '';
+  try {
+    const r = await post('/api/changeover-preview',
+                         {review_ids: selectedChangeoverIds(), clean_minutes: {}});
+    renderChangeoverMinutes(r.allergen_union);
+  } catch (e) {
+    $('changeover-minutes').innerHTML = '';
+    $('changeover-msg').textContent = changeoverErrorText(e);
+  }
+}
+
+function renderChangeoverMinutes(union) {
+  const computeBtn = '<div class="toolbar"><button onclick="computeChangeover()">计算最优换线顺序</button></div>';
+  if (!union.length) {
+    $('changeover-minutes').innerHTML =
+      `<div class="result-block"><h3>各过敏原清洁分钟数</h3>
+       <p class="hint">所选产品均不含过敏原，任意顺序总清洁时间均为 0。</p>${computeBtn}</div>`;
+    return;
+  }
+  const rows = union.map(a => {
+    const v = changeoverMinutes[a] !== undefined ? changeoverMinutes[a] : 0;
+    return `<label style="display:flex;align-items:center;gap:6px;margin:0">
+      <span style="flex:1">${esc(a)}</span>
+      <input type="number" min="0" step="any" value="${v}" data-allergen="${esc(a)}"
+        style="width:110px;padding:6px 8px;border:1px solid #c9d1d9;border-radius:6px"> 分钟
+    </label>`;
+  }).join('');
+  $('changeover-minutes').innerHTML =
+    `<div class="result-block"><h3>各过敏原清洁分钟数（所选产品过敏原并集）</h3>
+     <div class="check-grid" style="grid-template-columns:repeat(auto-fill,minmax(220px,1fr))">${rows}</div>
+     ${computeBtn}</div>`;
+}
+
+async function computeChangeover() {
+  document.querySelectorAll('#changeover-minutes input[type=number]').forEach(i => {
+    const v = parseFloat(i.value);
+    changeoverMinutes[i.dataset.allergen] = isNaN(v) ? 0 : v;
+  });
+  $('changeover-msg').textContent = '';
+  try {
+    const r = await post('/api/changeover-preview', {
+      review_ids: selectedChangeoverIds(),
+      clean_minutes: changeoverMinutes,
+    });
+    renderChangeoverResult(r);
+  } catch (e) {
+    $('changeover-result').innerHTML = '';
+    $('changeover-msg').textContent = changeoverErrorText(e);
+  }
+}
+
+function renderChangeoverResult(r) {
+  const orderLine = r.products.map(p =>
+    `<b>#${p.id}</b> ${esc(p.name)}`).join(' <span class="src-arrow">→</span> ');
+  const rows = r.segments.map((s, i) => `<tr>
+    <td>${i + 1}</td>
+    <td>#${s.from_id} ${esc(s.from_name)} <span class="src-arrow">→</span> #${s.to_id} ${esc(s.to_name)}</td>
+    <td>${badges(s.allergens, 'miss')}</td>
+    <td>${s.minutes}</td><td>${s.cumulative}</td></tr>`).join('');
+  const allergenNote = r.products.map(p =>
+    `#${p.id}：${p.allergens.join('、') || '无'}`).join('；');
+  $('changeover-result').innerHTML =
+    `<div class="result-block"><h3>最优生产顺序
+       <span class="pill green">总清洁时间 ${r.total_minutes} 分钟</span></h3>
+     <p style="line-height:2">${orderLine}</p>
+     <table><tr><th style="width:3em">段</th><th>换线</th><th>需清洁过敏原</th>
+       <th style="width:7em">耗时（分钟）</th><th style="width:7em">累计（分钟）</th></tr>${rows}</table>
+     <p class="hint">各产品当前配方过敏原：${esc(allergenNote)}。
+       若多个顺序总耗时相同，按产品 ID 序列字典序取最小者。本预览不写入审查记录。</p></div>`;
+  $('changeover-result').scrollIntoView({behavior: 'smooth'});
 }
 
 /* ---------- 供应商方案风险区间（临时预览） ---------- */
